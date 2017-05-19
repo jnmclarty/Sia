@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/url"
 	"os"
@@ -122,23 +123,37 @@ func waitForDownloadToComplete(t *testing.T, st *serverTester, siapath string, e
 	}
 }
 
+// runDownloadTest uploads a file and downloads it using the specified
+// parameters, verifying that the parameters are applied correctly and the file
+// is downloaded successfully.
 func runDownloadTest(t *testing.T, filesize, offset, length int64, useHttpResp bool) error {
 	ulSiaPath := "test.dat"
 	st, path := setupTestDownload(t, int(filesize), ulSiaPath, true)
-	defer st.server.Close()
+	defer func() {
+		st.server.Close()
+		os.Remove(path)
+	}()
 
 	// Read the section to be downloaded from the original file.
-	uf, _ := os.Open(path) // Uploaded file.
-	b := make([]byte, length)
+	uf, err := os.Open(path) // Uploaded file.
+	if err != nil {
+		return err
+	}
+	var originalBytes bytes.Buffer
 	uf.Seek(offset, 0)
-	uf.Read(b)
+	_, err = io.Copy(&originalBytes, uf)
+	if err != nil {
+		return err
+	}
 
 	// Download the original file from the passed offsets.
 	fname := "offsetsinglechunk.dat"
 	downpath := filepath.Join(st.dir, fname)
+	defer os.Remove(downpath)
+
 	dlURL := fmt.Sprintf("/renter/download/%s?offset=%d&length=%d", ulSiaPath, offset, length)
 
-	var downbytes []byte // Contains the downloaded data.
+	var downbytes bytes.Buffer
 
 	if useHttpResp {
 		dlURL += "&httpresp=true"
@@ -149,17 +164,9 @@ func runDownloadTest(t *testing.T, filesize, offset, length int64, useHttpResp b
 		}
 		defer resp.Body.Close()
 
-		buf := bytes.NewBuffer(make([]byte, 0, length))
-
-		_, readErr := buf.ReadFrom(resp.Body)
-		if readErr != nil {
-			return readErr
-		}
-		downbytes = buf.Bytes()
-
-		// Check size.
-		if int64(len(downbytes)) != length {
-			return errors.New(fmt.Sprintf("Downloaded content has incorrect size: %d, %d expected.", len(downbytes), length))
+		_, err = io.Copy(&downbytes, resp.Body)
+		if err != nil {
+			return err
 		}
 	} else {
 		dlURL += "&destination=" + downpath
@@ -169,20 +176,26 @@ func runDownloadTest(t *testing.T, filesize, offset, length int64, useHttpResp b
 		}
 		waitForDownloadToComplete(t, st, ulSiaPath, "/renter/download with offset failed.") // TODO: Fix error message.
 
-		df, _ := os.Open(downpath) // Downloaded file.
-		fInfo, _ := df.Stat()
-		if int64(fInfo.Size()) != length {
-			return errors.New(fmt.Sprintf("Downloaded file has incorrect size: %d, %d expected.", fInfo.Size(), length))
+		df, err := os.Open(downpath) // Downloaded file.
+		if err != nil {
+			return err
 		}
-		downbytes = make([]byte, length)
-		df.Read(downbytes)
-		df.Close()
-		os.Remove(downpath)
+		defer df.Close()
+
+		_, err = io.Copy(&downbytes, df)
+		if err != nil {
+			return err
+		}
 	}
 
-	eq := bytes.Compare(b, downbytes)
-	if eq != 0 {
-		return errors.New(fmt.Sprintf("Downloaded content does not equal expected. eq=%d", eq))
+	// should have correct length
+	if int64(downbytes.Len()) != length {
+		return errors.New(fmt.Sprintf("downloaded file has incorrect size: %d, %d expected.", downbytes.Len(), length))
+	}
+
+	// should be byte-for-byte equal to the original uploaded file
+	if bytes.Compare(originalBytes.Bytes(), downbytes.Bytes()) != 0 {
+		return errors.New(fmt.Sprintf("downloaded content differs from original content"))
 	}
 
 	return nil
